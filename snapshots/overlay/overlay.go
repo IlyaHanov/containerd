@@ -44,6 +44,7 @@ const upperdirKey = "containerd.io/snapshot/overlay.upperdir"
 type SnapshotterConfig struct {
 	asyncRemove   bool
 	upperdirLabel bool
+	remapIds      bool
 }
 
 // Opt is an option to configure the overlay snapshotter
@@ -67,11 +68,17 @@ func WithUpperdirLabel(config *SnapshotterConfig) error {
 	return nil
 }
 
+func WithRemapIds(config *SnapshotterConfig) error {
+	config.remapIds = true
+	return nil
+}
+
 type snapshotter struct {
 	root          string
 	ms            *storage.MetaStore
 	asyncRemove   bool
 	upperdirLabel bool
+	remapIds      bool
 	indexOff      bool
 	userxattr     bool // whether to enable "userxattr" mount option
 }
@@ -116,6 +123,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		ms:            ms,
 		asyncRemove:   config.asyncRemove,
 		upperdirLabel: config.upperdirLabel,
+		remapIds:      config.remapIds,
 		indexOff:      supportsIndex(),
 		userxattr:     userxattr,
 	}, nil
