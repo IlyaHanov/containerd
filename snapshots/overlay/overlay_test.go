@@ -26,12 +26,14 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/testutil"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/overlay/overlayutils"
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/containerd/containerd/snapshots/testsuite"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func newSnapshotterWithOpts(opts ...Opt) testsuite.SnapshotterFunc {
@@ -51,12 +53,22 @@ func TestOverlay(t *testing.T) {
 		"no opt": nil,
 		// default in init()
 		"AsynchronousRemove": {AsynchronousRemove},
+		// idmapped mounts enabled
+		"WithRemapIds": {WithRemapIds},
 	}
 
 	for optsName, opts := range optTestCases {
 		t.Run(optsName, func(t *testing.T) {
 			newSnapshotter := newSnapshotterWithOpts(opts...)
 			testsuite.SnapshotterSuite(t, "overlayfs", newSnapshotter)
+			if optsName == "WithRemapIds" {
+				t.Run("TestOverlayRemappedBind", func(t *testing.T) {
+					testOverlayRemappedBind(t, newSnapshotter)
+				})
+				t.Run("TestOverlayRemappedActive", func(t *testing.T) {
+					testOverlayRemappedActive(t, newSnapshotter)
+				})
+			}
 			t.Run("TestOverlayMounts", func(t *testing.T) {
 				testOverlayMounts(t, newSnapshotter)
 			})
@@ -156,32 +168,206 @@ func testOverlayOverlayMount(t *testing.T, newSnapshotter testsuite.SnapshotterF
 		t.Errorf("expected source %q but received %q", "overlay", m.Source)
 	}
 	var (
-		bp    = getBasePath(ctx, o, root, "/tmp/layer2")
-		work  = "workdir=" + filepath.Join(bp, "work")
-		upper = "upperdir=" + filepath.Join(bp, "fs")
-		lower = "lowerdir=" + getParents(ctx, o, root, "/tmp/layer2")[0]
+		expected []string
+		bp       = getBasePath(ctx, o, root, "/tmp/layer2")
+		work     = "workdir=" + filepath.Join(bp, "work")
+		upper    = "upperdir=" + filepath.Join(bp, "fs")
+		lower    = "lowerdir=" + getParents(ctx, o, root, "/tmp/layer2")[0]
 	)
 
-	expected := []string{
-		"index=off",
-	}
+	expected = append(expected, []string{
+		work,
+		upper,
+		lower,
+	}...)
+
 	if !supportsIndex() {
-		expected = expected[1:]
+		expected = append(expected, "index=off")
 	}
 	if userxattr, err := overlayutils.NeedsUserXAttr(root); err != nil {
 		t.Fatal(err)
 	} else if userxattr {
 		expected = append(expected, "userxattr")
 	}
-	expected = append(expected, []string{
-		work,
-		upper,
-		lower,
-	}...)
+
 	for i, v := range expected {
 		if m.Options[i] != v {
 			t.Errorf("expected %q but received %q", v, m.Options[i])
 		}
+	}
+}
+
+func testOverlayRemappedBind(t *testing.T, newSnapshotter testsuite.SnapshotterFunc) {
+	var (
+		opts   []snapshots.Opt
+		mounts []mount.Mount
+	)
+
+	ctx := context.TODO()
+	root := t.TempDir()
+	o, _, err := newSnapshotter(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostID := uint32(666)
+	contID := uint32(0)
+	length := uint32(65536)
+
+	uidMap := specs.LinuxIDMapping{
+		ContainerID: contID,
+		HostID:      hostID,
+		Size:        length,
+	}
+	gidMap := specs.LinuxIDMapping{
+		ContainerID: contID,
+		HostID:      hostID,
+		Size:        length,
+	}
+	opts = append(opts, containerd.WithRemapperLabels(
+		uidMap.ContainerID, uidMap.HostID,
+		gidMap.ContainerID, gidMap.HostID,
+		length),
+	)
+
+	key := "/tmp/test"
+	if mounts, err = o.Prepare(ctx, key, "", opts...); err != nil {
+		t.Fatal(err)
+	}
+
+	bp := getBasePath(ctx, o, root, key)
+	expected := []string{
+		fmt.Sprintf("uidmap=%d:%d:%d", uidMap.ContainerID, uidMap.HostID, uidMap.Size),
+		fmt.Sprintf("gidmap=%d:%d:%d", gidMap.ContainerID, gidMap.HostID, gidMap.Size),
+		"rw",
+		"rbind",
+	}
+
+	checkMountOpts := func() {
+		if len(mounts) != 1 {
+			t.Errorf("should only have 1 mount but received %d", len(mounts))
+		}
+
+		// no need to check "lowerdir" and "workdir"
+		if len(mounts[0].Options) != len(expected) {
+			t.Errorf("expected %d options, but received %d", len(expected), len(mounts[0].Options))
+		}
+
+		m := mounts[0]
+		for i, v := range expected {
+			if m.Options[i] != v {
+				t.Errorf("mount option %q is not valid, expected %q", m.Options[i], v)
+			}
+		}
+
+		st, err := os.Stat(filepath.Join(bp, "fs"))
+		if err != nil {
+			t.Errorf("failed to stat %s", filepath.Join(bp, "fs"))
+		}
+		stat := st.Sys().(*syscall.Stat_t)
+		if stat.Uid != uidMap.HostID || stat.Gid != gidMap.HostID {
+			t.Errorf("bad mapping: expected {uid: %d, gid: %d}; real {uid: %d, gid: %d}", uidMap.HostID, gidMap.HostID, int(stat.Uid), int(stat.Gid))
+		}
+	}
+	checkMountOpts()
+
+	expected[2] = "ro"
+	if err = o.Commit(ctx, "base", key, opts...); err != nil {
+		t.Fatal(err)
+	}
+	if mounts, err = o.View(ctx, key, "base", opts...); err != nil {
+		t.Fatal(err)
+	}
+	bp = getBasePath(ctx, o, root, key)
+	checkMountOpts()
+
+	key = "/tmp/test1"
+	if mounts, err = o.Prepare(ctx, key, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bp = getBasePath(ctx, o, root, key)
+
+	expected = expected[2:]
+	expected[0] = "rw"
+
+	uidMap.HostID = 0
+	gidMap.HostID = 0
+
+	checkMountOpts()
+}
+
+func testOverlayRemappedActive(t *testing.T, newSnapshotter testsuite.SnapshotterFunc) {
+	var (
+		opts   []snapshots.Opt
+		mounts []mount.Mount
+	)
+
+	ctx := context.TODO()
+	root := t.TempDir()
+	o, _, err := newSnapshotter(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostID := uint32(666)
+	contID := uint32(0)
+	length := uint32(65536)
+
+	uidMap := specs.LinuxIDMapping{
+		ContainerID: contID,
+		HostID:      hostID,
+		Size:        length,
+	}
+	gidMap := specs.LinuxIDMapping{
+		ContainerID: contID,
+		HostID:      hostID,
+		Size:        length,
+	}
+	opts = append(opts, containerd.WithRemapperLabels(
+		uidMap.ContainerID, uidMap.HostID,
+		gidMap.ContainerID, gidMap.HostID,
+		length),
+	)
+
+	key := "/tmp/test"
+	if _, err = o.Prepare(ctx, key, "", opts...); err != nil {
+		t.Fatal(err)
+	}
+	if err = o.Commit(ctx, "base", key, opts...); err != nil {
+		t.Fatal(err)
+	}
+	if mounts, err = o.Prepare(ctx, key, "base", opts...); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mounts) != 1 {
+		t.Errorf("should only have 1 mount but received %d", len(mounts))
+	}
+
+	bp := getBasePath(ctx, o, root, key)
+	expected := []string{
+		fmt.Sprintf("uidmap=%d:%d:%d", uidMap.ContainerID, uidMap.HostID, uidMap.Size),
+		fmt.Sprintf("gidmap=%d:%d:%d", gidMap.ContainerID, gidMap.HostID, gidMap.Size),
+		fmt.Sprintf("workdir=%s", filepath.Join(bp, "work")),
+		fmt.Sprintf("upperdir=%s", filepath.Join(bp, "fs")),
+		fmt.Sprintf("lowerdir=%s", getParents(ctx, o, root, key)[0]),
+	}
+
+	m := mounts[0]
+	for i, v := range expected {
+		if m.Options[i] != v {
+			t.Errorf("mount option %q is invalid, expected %q", m.Options[i], v)
+		}
+	}
+
+	st, err := os.Stat(filepath.Join(bp, "fs"))
+	if err != nil {
+		t.Errorf("failed to stat %s", filepath.Join(bp, "fs"))
+	}
+	stat := st.Sys().(*syscall.Stat_t)
+	if stat.Uid != uidMap.HostID || stat.Gid != gidMap.HostID {
+		t.Errorf("bad mapping: expected {uid: %d, gid: %d}; received {uid: %d, gid: %d}", uidMap.HostID, gidMap.HostID, int(stat.Uid), int(stat.Gid))
 	}
 }
 
@@ -345,15 +531,9 @@ func testOverlayView(t *testing.T, newSnapshotter testsuite.SnapshotterFunc) {
 		t.Errorf("expected %d additional mount option but got %d", expectedOptions, len(m.Options))
 	}
 	lowers := getParents(ctx, o, root, "/tmp/view2")
+
 	expected = fmt.Sprintf("lowerdir=%s:%s", lowers[0], lowers[1])
-	optIdx := 1
-	if !supportsIndex {
-		optIdx--
-	}
-	if userxattr {
-		optIdx++
-	}
-	if m.Options[optIdx] != expected {
-		t.Errorf("expected option %q but received %q", expected, m.Options[optIdx])
+	if m.Options[0] != expected {
+		t.Errorf("expected option %q but received %q", expected, m.Options[0])
 	}
 }
